@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
 
+# converts an apgap metadata csv into a seqera/nextflow samplesheet.
+#
+# input:  the apgap metadata csv (the _apgap_metadata.csv export). only its
+#         `filename` column is read; all other columns are ignored. filenames
+#         are bare basenames, so a bucket prefix is needed to make real paths.
+# output: a comma-separated samplesheet with columns sample,fastq_1,fastq_2,
+#         one row per sample, sorted by sample name.
+#
+# how it maps input to output:
+#   - keep only fastq filenames (.fastq.gz / .fq.gz); warn-and-skip the rest.
+#   - pair R1/R2 by filename via PAIR_RE; single-end samples have empty fastq_2.
+#   - prepend --prefix (e.g. gs://bucket/reads/) to each filename for the path.
+#   - sample name comes from the filename; spaces become underscores.
+#
+# notes:
+#   - output format is identical to make_viralrecon_samplesheet.py's illumina
+#     sheet, so check_viralrecon_samplesheet.py validates it.
+#   - this only builds the samplesheet; it does not launch nextflow/seqera.
+#   - run with --help for argument details.
+
 import argparse
 import csv
 import fnmatch
@@ -8,17 +28,12 @@ from collections import defaultdict
 from pathlib import Path
 import re
 
-
+# matches sample_R1_001.fastq.gz, sample_R1.fastq.gz, sample_1.fastq.gz -> (sample, read 1|2)
 PAIR_RE = re.compile(r"^(?P<sample>.+?)_R?(?P<read>[12])(?:_\d{3})?\.(?:fastq|fq)\.gz$")
 FASTQ_EXTS = (".fastq.gz", ".fq.gz")
 
 
 def read_filenames(metadata_csv):
-    """Return the `filename` values from the metadata CSV, in file order.
-
-    Errors clearly if the file is missing or has no `filename` column. Blank
-    filename cells are skipped.
-    """
     try:
         text = Path(metadata_csv).read_text()
     except OSError as exc:
@@ -26,7 +41,7 @@ def read_filenames(metadata_csv):
     reader = csv.DictReader(text.splitlines())
     if reader.fieldnames is None:
         sys.exit(f"metadata CSV {metadata_csv} is empty")
-        
+    # match the filename column tolerantly (stray whitespace / casing)
     field = next((f for f in reader.fieldnames if f.strip().lower() == "filename"), None)
     if field is None:
         sys.exit(f"metadata CSV {metadata_csv} has no 'filename' column "
@@ -35,7 +50,6 @@ def read_filenames(metadata_csv):
 
 
 def select_fastqs(filenames, patterns=None):
-    """Keep only FASTQ filenames, warning on the rest; apply optional --include."""
     fastqs = []
     for name in filenames:
         if not name.endswith(FASTQ_EXTS):
@@ -49,7 +63,6 @@ def select_fastqs(filenames, patterns=None):
 
 
 def pair_short_reads(filenames):
-    """Group paired/single short reads by sample into r1/r2 slots."""
     samples = defaultdict(dict)
     for name in filenames:
         match = PAIR_RE.match(name)
@@ -61,7 +74,7 @@ def pair_short_reads(filenames):
 
 
 def sanitize_sample(name):
-    """viralrecon converts spaces in sample names to underscores; do it up front."""
+    # viralrecon converts spaces to underscores; match that up front
     if " " in name:
         fixed = name.replace(" ", "_")
         print(f"WARNING: sample '{name}' contains spaces; using '{fixed}'", file=sys.stderr)
@@ -70,25 +83,23 @@ def sanitize_sample(name):
 
 
 def with_prefix(prefix, filename):
-    """Join --prefix and a filename with exactly one '/'. Empty prefix -> bare name."""
     if not prefix:
         return filename
     return prefix.rstrip("/") + "/" + filename
 
 
 def build_rows(filenames, prefix):
-    """Return (header, rows) for a sample,fastq_1,fastq_2 sheet."""
     rows = []
     for sample, reads in sorted(pair_short_reads(filenames).items()):
         r1 = reads.get("r1")
-        r2 = reads.get("r2")  # may be None for single-end
+        r2 = reads.get("r2")
         if not r1:
             print(f"WARNING: sample '{sample}' has R2 but no R1; skipping", file=sys.stderr)
             continue
         rows.append([
             sanitize_sample(sample),
             with_prefix(prefix, r1),
-            with_prefix(prefix, r2) if r2 else "",
+            with_prefix(prefix, r2) if r2 else "",  # single-end -> empty fastq_2
         ])
     return ["sample", "fastq_1", "fastq_2"], rows
 
@@ -127,7 +138,7 @@ def main():
         sys.exit("No samples assembled; check your inputs")
 
     with open(args.output, "w", newline="") as handle:
-        writer = csv.writer(handle, lineterminator="\n")  # comma: nf-core requires CSV
+        writer = csv.writer(handle, lineterminator="\n")  # nf-core requires csv
         writer.writerow(header)
         writer.writerows(rows)
 
